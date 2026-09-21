@@ -1,0 +1,146 @@
+// weather.c | 20234014 이은정
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <curl/curl.h>
+
+#define INPUT_FILE "rainfall.txt"
+#define API_URL "https://apihub.kma.go.kr/api/typ01/url/gts_syn1.php?tm=202211301200&dtm=10&stn=47&help=1&authKey=njld-D40Rb25Xfg-NAW9hA"
+#define BUFFER_SIZE 5
+
+typedef struct {
+    float temperature;
+    float humidity;
+    float rainfall;
+} SensorData;
+
+SensorData buffer[BUFFER_SIZE];
+int in = 0, out = 0, count = 0;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t not_full = PTHREAD_COND_INITIALIZER;
+pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
+
+// 다운로드 콜백 함수
+size_t write_data(void* ptr, size_t size, size_t nmemb, FILE* stream) {
+    return fwrite(ptr, size, nmemb, stream);
+}
+
+// API 파일 다운로드
+int download_file(const char* url, const char* filename) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return 1;
+
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return 1;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+
+    CURLcode res = curl_easy_perform(curl);
+    fclose(fp);
+    curl_easy_cleanup(curl);
+    return res != CURLE_OK;
+}
+
+// 생산자 스레드 함수
+void* producer(void* arg) {
+    char line[1024];
+
+    if (download_file(API_URL, INPUT_FILE) != 0) {
+        fprintf(stderr, "Download failed.\n");
+        pthread_exit(NULL);
+    }
+
+    FILE* fp = fopen(INPUT_FILE, "r");
+    if (!fp) {
+        perror("fopen");
+        pthread_exit(NULL);
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || strlen(line) < 20) continue; // 주석/빈 줄 무시
+
+        float temperature = -999, humidity = -999, rainfall = -999;
+        int field_index = 0;
+
+        char* token = strtok(line, " ");
+        while (token != NULL) {
+            if (field_index == 10)
+                temperature = atof(token);
+            else if (field_index == 12)
+                humidity = atof(token);
+            else if (field_index == 17) {
+                rainfall = atof(token);
+                break;
+            }
+            token = strtok(NULL, "\t");
+            field_index++;
+        }
+
+        pthread_mutex_lock(&mutex);
+        while (count == BUFFER_SIZE)
+            pthread_cond_wait(&not_full, &mutex);
+
+        buffer[in] = (SensorData){temperature, humidity, rainfall};
+        in = (in + 1) % BUFFER_SIZE;
+        count++;
+
+        printf("[Producer] Produced: %.1f°C, %.1f%%, %.1fmm\n", temperature, humidity, rainfall);
+
+        pthread_cond_signal(&not_empty);
+        pthread_mutex_unlock(&mutex);
+
+        sleep(1);
+    }
+
+    fclose(fp);
+    pthread_exit(NULL);
+}
+
+// 소비자 스레드 함수
+void* consumer(void* arg) {
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        while (count == 0)
+            pthread_cond_wait(&not_empty, &mutex);
+
+        SensorData data = buffer[out];
+        out = (out + 1) % BUFFER_SIZE;
+        count--;
+
+        pthread_cond_signal(&not_full);
+        pthread_mutex_unlock(&mutex);
+
+        printf("[Consumer] Consumed: %.1f°C, %.1f%%, %.1fmm\n",
+               data.temperature, data.humidity, data.rainfall);
+
+        if (data.temperature > 30.0)
+            printf("[Warning] High Temperature Alert!\n");
+        if (data.humidity > 80.0)
+            printf("[Warning] High Humidity Alert!\n");
+        if (data.rainfall > 30.0)
+            printf("[Warning] Heavy Rainfall Alert!\n");
+
+        sleep(2);
+    }
+
+    pthread_exit(NULL);
+}
+
+int main() {
+    pthread_t prod_thread, cons_thread;
+
+    curl_global_init(CURL_GLOBAL_ALL);
+    pthread_create(&prod_thread, NULL, producer, NULL);
+    pthread_create(&cons_thread, NULL, consumer, NULL);
+
+    pthread_join(prod_thread, NULL);
+    // consumer는 무한 루프
+
+    curl_global_cleanup();
+    return 0;
+}
